@@ -1,0 +1,257 @@
+#!/bin/sh
+# 
+# Docker network helper 
+# custom/simple version based on github.com/jpetazzo/pipework
+#
+# vdeluca@zendesk.com
+# March, 2015
+#
+set -e
+
+DEBUG=1
+
+IFNAME=$1
+
+# default value set further down if not set here
+CONTAINER_IFNAME=
+if [ "$2" = "-i" ]; then
+  CONTAINER_IFNAME=$3
+  shift 2
+fi
+
+GUESTNAME=$2
+IPADDR=$3
+MACADDR=$4
+
+case "$1" in
+    --wait)
+      WAIT=1
+      ;;
+    inspect)
+      HWAddr=$(docker exec $GUESTNAME ip addr show eth0 |grep -E "ether" | awk '{print $2}')
+      Gateway=$(docker exec $GUESTNAME ip route list | grep default | awk '{print $3}')
+      IPAddress=$(docker exec $GUESTNAME ip addr show eth0 |grep -E "inet[ ]" | awk '{print $2}')
+      DNS=($(docker exec $GUESTNAME cat /etc/resolv.conf | grep nameserver | awk '{print $2}'))
+      Bridge=$(brctl show | head -2 | tail -1 |  awk '{print $1}')
+      echo '{ 
+ 	"Container": "'$GUESTNAME'",
+        "NetworkSettings": {
+          "HWAddr": "'$HWAddr'", 
+          "Bridge": "'$Bridge'", 
+          "IPAddress": "'$(echo $IPAddress |cut -d/ -f1)'", 
+          "IPPrefixLen": "'$(echo $IPAddress |cut -d/ -f2)'", 
+	  "Gateway": "'$Gateway'",
+	  "DNS": "'$(echo ${DNS[@]} | sed 's/\s/, /g')'",
+          "DHCP_PID": "'$(cat /var/run/dhclient-docker.$GUESTNAME.pid)'" 
+} }'
+      exit 0
+      ;;
+    inspect-all)
+      for i in $(docker ps -q) ; do network-wrapper inspect $i ; done
+      exit 0
+      ;;
+esac
+
+
+if echo $MACADDR | grep -q @
+then
+  VLAN=$(echo $MACADDR | cut -d@ -f2)
+  MACADDR=$(echo $MACADDR | cut -d@ -f1)
+else
+  VLAN=
+  while [[ -z "$MACADDR" ]] ; do
+    ipaddr=$(ip addr show br0 | grep "inet[ ]" | awk '{print $2}' | cut -d/ -f1)
+    candidatemac="$(printf '%02x' $(( 0x$(od /dev/urandom -N1 -t x1 -An | cut -c 2-) & 0xFE | 0x02)) ;)$(gethostip $ipaddr | awk '{ print tolower(substr($3,3)) }' | sed 's/.\{2\}/:&/g' |tr \  : ):$(od /dev/urandom -N2 -t x1 -An | cut -c 2- | sed 's/ /:/g')"
+    # get current CAM and ARP tables for mac clearance (includes local and remote macs)
+    camtable=$(brctl showmacs br0 | tail -n +2 | awk '{print $2}')
+    arptable=$(arp -an | awk '{print $4}')
+    if [[ "$camtable" == *"$candidatemac"* ]] || [[ "$arptable" == *"$candidatemac"* ]] ; then
+      echo -n .
+    else
+      MACADDR=$candidatemac
+    fi
+  done
+fi
+
+[ "$IPADDR" ] || [ "$WAIT" ] || {
+    echo "Syntax:"
+    echo "network-wrapper inspect[-all] <guestID>"
+    echo "network-wrapper <HostOS-interface> [-i Container-interface] <guestID> dhcp [macaddr]"
+    exit 1
+}
+
+# First step: determine type of first argument (bridge, physical interface...), skip if --wait set
+if [ -z "$WAIT" ]; then 
+    if [ -d /sys/class/net/$IFNAME ]
+    then
+        if [ -d /sys/class/net/$IFNAME/bridge ]
+        then
+            IFTYPE=bridge
+            BRTYPE=linux
+        else 
+	    IFTYPE=phys
+        fi
+    else
+        case "$IFNAME" in
+        br*)
+            IFTYPE=bridge
+            BRTYPE=linux
+            ;;
+        *)
+            echo "I do not know how to setup interface $IFNAME."
+            exit 1
+            ;;
+        esac
+    fi
+fi
+
+# Set the default container interface name to eth0 
+CONTAINER_IFNAME=${CONTAINER_IFNAME:-eth0}
+
+[ "$WAIT" ] && {
+  while ! grep -q ^1$ /sys/class/net/$CONTAINER_IFNAME/carrier 2>/dev/null
+  do sleep 1
+  done
+  exit 0
+}
+
+# Second step: find the guest (for now, we only support LXC containers)
+while read dev mnt fstype options dump fsck
+do
+    [ "$fstype" != "cgroup" ] && continue
+    echo $options | grep -qw devices || continue
+    CGROUPMNT=$mnt
+done < /proc/mounts
+
+[ "$CGROUPMNT" ] || {
+    echo "Could not locate cgroup mount point."
+    exit 1
+}
+
+# Try to find a cgroup matching exactly the provided name.
+N=$(find "$CGROUPMNT" -name "$GUESTNAME" | wc -l)
+case "$N" in
+    0)
+	# If we didn't find anything, try to lookup the container with Docker.
+	if which docker >/dev/null
+	then
+        RETRIES=3
+        while [ $RETRIES -gt 0 ]; do
+      	    DOCKERPID=$(docker inspect --format='{{ .State.Pid }}' $GUESTNAME)
+            [ $DOCKERPID != 0 ] && break
+            sleep 1
+            RETRIES=$((RETRIES - 1))
+        done
+
+        [ "$DOCKERPID" = 0 ] && {
+      		echo "Docker inspect returned invalid PID 0"
+    		exit 1
+      	}
+
+        [ "$DOCKERPID" = "<no value>" ] && {
+      		echo "Container $GUESTNAME not found, and unknown to Docker."
+    		exit 1
+      	}
+	else
+	    echo "Container $GUESTNAME not found, and Docker not installed."
+	    exit 1
+	fi
+	;;
+    1)
+	true
+	;;
+    *)
+	echo "Found more than one container matching $GUESTNAME."
+	exit 1
+	;;
+esac
+
+if [ "$IPADDR" = "dhcp" ]
+then
+    # Check for first available dhcp client
+    DHCP_CLIENT_LIST="dhclient udhcpc"
+    for CLIENT in $DHCP_CLIENT_LIST; do
+        which $CLIENT >/dev/null && {
+            DHCP_CLIENT=$CLIENT
+            break
+        }
+    done
+    [ -z $DHCP_CLIENT ] && {
+    	echo "You asked for DHCP; but no DHCP client could be found."
+    	exit 1
+    }
+else
+    echo "only DHCP client supported at the moment"
+    exit 1
+fi
+
+if [ $DOCKERPID ]; then
+  NSPID=$DOCKERPID
+else
+  NSPID=$(head -n 1 $(find "$CGROUPMNT" -name "$GUESTNAME" | head -n 1)/tasks)
+  [ "$NSPID" ] || {
+      echo "Could not find a process inside container $GUESTNAME."
+      exit 1
+  }
+fi
+
+[ ! -d /var/run/netns ] && mkdir -p /var/run/netns
+[ -f /var/run/netns/$NSPID ] && rm -f /var/run/netns/$NSPID
+ln -s /proc/$NSPID/ns/net /var/run/netns/$NSPID
+
+# Check if we need to create a bridge.
+[ $IFTYPE = bridge ] && [ ! -d /sys/class/net/$IFNAME ] && {
+    [ $BRTYPE = linux ] && {
+        (ip link add dev $IFNAME type bridge > /dev/null 2>&1) || (brctl addbr $IFNAME)
+        ip link set $IFNAME up
+    }
+}
+
+MTU=$(ip link show $IFNAME | awk '{print $5}')
+# If it's a bridge, we need to create a veth pair
+[ $IFTYPE = bridge ] && {
+    LOCAL_IFNAME="v${CONTAINER_IFNAME}pl${NSPID}"
+    GUEST_IFNAME="v${CONTAINER_IFNAME}pg${NSPID}"
+    ip link add name $LOCAL_IFNAME mtu $MTU type veth peer name $GUEST_IFNAME mtu $MTU
+    case "$BRTYPE" in
+        linux)
+            (ip link set $LOCAL_IFNAME master $IFNAME > /dev/null 2>&1) || (brctl addif $IFNAME $LOCAL_IFNAME)
+            ;;
+    esac
+    ip link set $LOCAL_IFNAME up
+}
+
+ip link set $GUEST_IFNAME netns $NSPID
+ip netns exec $NSPID ip link set $GUEST_IFNAME name $CONTAINER_IFNAME
+[ "$MACADDR" ] && ip netns exec $NSPID ip link set dev $CONTAINER_IFNAME address $MACADDR
+if [ "$IPADDR" = "dhcp" ]
+then
+    [ $DHCP_CLIENT = "udhcpc"  ] && ip netns exec $NSPID $DHCP_CLIENT -Si $CONTAINER_IFNAME -x hostname:$GUESTNAME ;
+     if [ $DHCP_CLIENT = "dhclient"  ]
+    then
+        # kill dhclient after get ip address to prevent device be used after container close
+        SHORTGUESTNAME=${GUESTNAME:0:12}
+	ip netns exec $NSPID $DHCP_CLIENT -pf "/var/run/dhclient-docker.$SHORTGUESTNAME.pid" -H $SHORTGUESTNAME $CONTAINER_IFNAME
+    fi
+else
+    echo "only udhcpc / dhclient currently supported"
+    exit 1   
+fi
+
+# Give our ARP neighbors a nudge about the new interface
+if which arping > /dev/null 2>&1
+then
+    ip netns exec $NSPID arping -c 1 -A -I $CONTAINER_IFNAME $(docker exec $GUESTNAME ip addr show eth0 |grep -E "inet[ ]" | awk '{print $2}' | cut -d/ -f1) > /dev/null 2>&1 || true
+else
+    echo "Warning: arping not found;"
+fi
+
+# Print some useful info
+if [ $DEBUG -eq 1 ] ; then
+  network-wrapper inspect $SHORTGUESTNAME
+fi
+# Remove NSPID to avoid `ip netns` catch it.
+[ -f /var/run/netns/$NSPID ] && rm -f /var/run/netns/$NSPID
+exit 0
+
+
