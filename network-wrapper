@@ -229,7 +229,6 @@ then
     [ $DHCP_CLIENT = "udhcpc"  ] && ip netns exec $NSPID $DHCP_CLIENT -Si $CONTAINER_IFNAME -x hostname:$GUESTNAME ;
      if [ $DHCP_CLIENT = "dhclient"  ]
     then
-        # kill dhclient after get ip address to prevent device be used after container close
         SHORTGUESTNAME=${GUESTNAME:0:12}
 	ip netns exec $NSPID $DHCP_CLIENT -pf "/var/run/dhclient-docker.$SHORTGUESTNAME.pid" -H $SHORTGUESTNAME $CONTAINER_IFNAME
     fi
