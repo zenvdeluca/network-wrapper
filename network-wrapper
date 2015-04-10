@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # 
 # Docker network helper 
 # custom/simple version based on github.com/jpetazzo/pipework
