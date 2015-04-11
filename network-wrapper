@@ -5,7 +5,7 @@
 #
 # https://github.com/zenvdeluca/network-wrapper
 #
-# script requires being executed with root privileges, and being on path
+# needs to be executed with root privileges, as well being on path
 #
 
 set -e
