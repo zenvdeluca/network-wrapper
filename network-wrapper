@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # 
 # Docker network helper for using DHCP  
 # custom/simple version based on jpetazzo/pipework
