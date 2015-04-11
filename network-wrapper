@@ -1,11 +1,13 @@
 #!/bin/sh
 # 
-# Docker network helper 
-# custom/simple version based on github.com/jpetazzo/pipework
+# Docker network helper for using DHCP  
+# custom/simple version based on jpetazzo/pipework
 #
-# vdeluca@zendesk.com
-# March, 2015
+# https://github.com/zenvdeluca/network-wrapper
 #
+# script requires being executed with root privileges, and being on path
+#
+
 set -e
 
 DEBUG=1
