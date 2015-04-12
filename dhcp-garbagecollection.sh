@@ -1,9 +1,8 @@
 #!/bin/bash
 #
 # garbage collector for DHCP client vs. Docker containers
-#
-# vdeluca@zendesk.com
-# March, 2015
+# 
+# https://github.com/zenvdeluca/network-wrapper
 #
 
 diff(){
